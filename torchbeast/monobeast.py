@@ -21,20 +21,31 @@ import time
 import timeit
 import traceback
 import typing
+from typing import Dict, List
 
 os.environ["OMP_NUM_THREADS"] = "1"  # Necessary for multithreading.
 
+import numpy as np
 import torch
+import tree
 from torch import multiprocessing as mp
 from torch import nn
 from torch.nn import functional as F
 
-from torchbeast import atari_wrappers
-from torchbeast.core import environment
-from torchbeast.core import file_writer
-from torchbeast.core import prof
-from torchbeast.core import vtrace
+from torchbeast.core.multi_agent_env import MultiAgentEnvironment as Environment
+from torchbeast.core import file_writer, prof, vtrace
+from torchbeast.dummy_env import DummyEnv, DummyNet
 
+to_torch_dtype = {
+    "uint8": torch.uint8,
+    "int8": torch.int8,
+    "int16": torch.int16,
+    "int32": torch.int32,
+    "int64": torch.int64,
+    "float16": torch.float16,
+    "float32": torch.float32,
+    "float64": torch.float64,
+}
 
 # yapf: disable
 parser = argparse.ArgumentParser(description="PyTorch Scalable Agent")
@@ -93,11 +104,9 @@ parser.add_argument("--grad_norm_clipping", default=40.0, type=float,
                     help="Global gradient norm clip.")
 # yapf: enable
 
-
 logging.basicConfig(
-    format=(
-        "[%(levelname)s:%(process)d %(module)s:%(lineno)d %(asctime)s] " "%(message)s"
-    ),
+    format=("[%(levelname)s:%(process)d %(module)s:%(lineno)d %(asctime)s] "
+            "%(message)s"),
     level=0,
 )
 
@@ -105,7 +114,7 @@ Buffers = typing.Dict[str, typing.List[torch.Tensor]]
 
 
 def compute_baseline_loss(advantages):
-    return 0.5 * torch.sum(advantages ** 2)
+    return 0.5 * torch.sum(advantages**2)
 
 
 def compute_entropy_loss(logits):
@@ -125,6 +134,45 @@ def compute_policy_gradient_loss(logits, actions, advantages):
     return torch.sum(cross_entropy * advantages.detach())
 
 
+def store(env_output, agent_output, agent_state, buffers: Buffers,
+          initial_agent_state_buffers, free_indices, t):
+    indices_iter = iter(free_indices)
+    """Store tensor in buffer."""
+    for agent_id in env_output.keys():
+        index = next(indices_iter)
+
+        for key, val in env_output[agent_id].items():
+            buffers[key][index][t, ...] = val
+        for key, val in agent_output[agent_id].items():
+            buffers[key][index][t, ...] = val
+        for i, tensor in enumerate(agent_state):
+            initial_agent_state_buffers[index][i][...] = tensor
+
+
+def batch(env_output: Dict, filter_keys: List[str]):
+    """Transform agent-wise env_output to bach format."""
+    obs_batch = {key: [] for key in filter_keys}
+    agent_ids = []
+    for agent_id, out in env_output.items():
+        agent_ids.append(agent_id)
+        for key, val in out.items():
+            if key in filter_keys: obs_batch[key].append(val)
+    for key, val in obs_batch.items():
+        obs_batch[key] = torch.cat(val, dim=1)
+
+    return obs_batch, agent_ids
+
+
+def unbatch(agent_output: Dict, agent_ids):
+    """Transform agent_ouput to agent-wise format."""
+    unbatched_agent_output = {key: {} for key in agent_ids}
+    for key, val in agent_output.items():
+        for i, agent_id in enumerate(agent_ids):
+            unbatched_agent_output[agent_id][
+                key] = val[:, i]  # val shape: [1, B, ...]
+    return unbatched_agent_output
+
+
 def act(
     flags,
     actor_index: int,
@@ -141,43 +189,55 @@ def act(
         gym_env = create_env(flags)
         seed = actor_index ^ int.from_bytes(os.urandom(4), byteorder="little")
         gym_env.seed(seed)
-        env = environment.Environment(gym_env)
+        env = Environment(gym_env)
         env_output = env.initial()
         agent_state = model.initial_state(batch_size=1)
-        agent_output, unused_state = model(env_output, agent_state)
+        env_output_batch, agent_ids = batch(
+            env_output, filter_keys=gym_env.observation_space.keys())
+        agent_output_batch, unused_state = model(env_output_batch, agent_state)
+        agent_output = unbatch(agent_output_batch, agent_ids)
         while True:
-            index = free_queue.get()
-            if index is None:
+            free_indices = [
+                free_queue.get() for _ in range(len(gym_env.agents))
+            ]
+            if None in free_indices:
                 break
 
             # Write old rollout end.
-            for key in env_output:
-                buffers[key][index][0, ...] = env_output[key]
-            for key in agent_output:
-                buffers[key][index][0, ...] = agent_output[key]
-            for i, tensor in enumerate(agent_state):
-                initial_agent_state_buffers[index][i][...] = tensor
+            store(env_output, agent_output, agent_state, buffers,
+                  initial_agent_state_buffers, free_indices, 0)
 
             # Do new rollout.
             for t in range(flags.unroll_length):
                 timings.reset()
 
                 with torch.no_grad():
-                    agent_output, agent_state = model(env_output, agent_state)
+                    # batch
+                    env_output_batch, agent_ids = batch(
+                        env_output,
+                        filter_keys=gym_env.observation_space.keys())
+                    # forward inference
+                    agent_output_batch, agent_state = model(
+                        env_output_batch, agent_state)
+                    # unbatch
+                    agent_output = unbatch(agent_output_batch, agent_ids)
+                    # extract actions
+                    actions = {
+                        agent_id: agent_output[agent_id]["action"].item()
+                        for agent_id in agent_output
+                    }
 
                 timings.time("model")
 
-                env_output = env.step(agent_output["action"])
+                env_output = env.step(actions)
 
                 timings.time("step")
 
-                for key in env_output:
-                    buffers[key][index][t + 1, ...] = env_output[key]
-                for key in agent_output:
-                    buffers[key][index][t + 1, ...] = agent_output[key]
+                store(env_output, agent_output, (), buffers,
+                      initial_agent_state_buffers, free_indices, t + 1)
 
                 timings.time("write")
-            full_queue.put(index)
+            [full_queue.put(index) for index in free_indices]
 
         if actor_index == 0:
             logging.info("Actor %i: %s", actor_index, timings.summary())
@@ -192,46 +252,48 @@ def act(
 
 
 def get_batch(
-    flags,
-    free_queue: mp.SimpleQueue,
-    full_queue: mp.SimpleQueue,
-    buffers: Buffers,
-    initial_agent_state_buffers,
-    timings,
-    lock=threading.Lock(),
+        flags,
+        free_queue: mp.SimpleQueue,
+        full_queue: mp.SimpleQueue,
+        buffers: Buffers,
+        initial_agent_state_buffers,
+        timings,
+        lock=threading.Lock(),
 ):
     with lock:
         timings.time("lock")
         indices = [full_queue.get() for _ in range(flags.batch_size)]
         timings.time("dequeue")
     batch = {
-        key: torch.stack([buffers[key][m] for m in indices], dim=1) for key in buffers
+        key: torch.stack([buffers[key][m] for m in indices], dim=1)
+        for key in buffers
     }
-    initial_agent_state = (
-        torch.cat(ts, dim=1)
-        for ts in zip(*[initial_agent_state_buffers[m] for m in indices])
-    )
+    initial_agent_state = (torch.cat(ts, dim=1) for ts in zip(
+        *[initial_agent_state_buffers[m] for m in indices]))
     timings.time("batch")
     for m in indices:
         free_queue.put(m)
     timings.time("enqueue")
-    batch = {k: t.to(device=flags.device, non_blocking=True) for k, t in batch.items()}
+    batch = {
+        k: t.to(device=flags.device, non_blocking=True)
+        for k, t in batch.items()
+    }
     initial_agent_state = tuple(
-        t.to(device=flags.device, non_blocking=True) for t in initial_agent_state
-    )
+        t.to(device=flags.device, non_blocking=True)
+        for t in initial_agent_state)
     timings.time("device")
     return batch, initial_agent_state
 
 
 def learn(
-    flags,
-    actor_model,
-    model,
-    batch,
-    initial_agent_state,
-    optimizer,
-    scheduler,
-    lock=threading.Lock(),  # noqa: B008
+        flags,
+        actor_model,
+        model,
+        batch,
+        initial_agent_state,
+        optimizer,
+        scheduler,
+        lock=threading.Lock(),  # noqa: B008
 ):
     """Performs a learning (optimization) step."""
     with lock:
@@ -242,7 +304,10 @@ def learn(
 
         # Move from obs[t] -> action[t] to action[t] -> obs[t].
         batch = {key: tensor[1:] for key, tensor in batch.items()}
-        learner_outputs = {key: tensor[:-1] for key, tensor in learner_outputs.items()}
+        learner_outputs = {
+            key: tensor[:-1]
+            for key, tensor in learner_outputs.items()
+        }
 
         rewards = batch["reward"]
         if flags.reward_clipping == "abs_one":
@@ -268,11 +333,9 @@ def learn(
             vtrace_returns.pg_advantages,
         )
         baseline_loss = flags.baseline_cost * compute_baseline_loss(
-            vtrace_returns.vs - learner_outputs["baseline"]
-        )
+            vtrace_returns.vs - learner_outputs["baseline"])
         entropy_loss = flags.entropy_cost * compute_entropy_loss(
-            learner_outputs["policy_logits"]
-        )
+            learner_outputs["policy_logits"])
 
         total_loss = pg_loss + baseline_loss + entropy_loss
 
@@ -296,19 +359,25 @@ def learn(
         return stats
 
 
-def create_buffers(flags, obs_shape, num_actions) -> Buffers:
+def create_buffers(flags, observation_space, num_actions) -> Buffers:
     T = flags.unroll_length
+    # observation_space is a dict
+    obs_specs = {
+        key: dict(size=(T + 1, *val.shape),
+                  dtype=to_torch_dtype[val.dtype.name])
+        for key, val in observation_space.items()
+    }
     specs = dict(
-        frame=dict(size=(T + 1, *obs_shape), dtype=torch.uint8),
-        reward=dict(size=(T + 1,), dtype=torch.float32),
-        done=dict(size=(T + 1,), dtype=torch.bool),
-        episode_return=dict(size=(T + 1,), dtype=torch.float32),
-        episode_step=dict(size=(T + 1,), dtype=torch.int32),
+        reward=dict(size=(T + 1, ), dtype=torch.float32),
+        done=dict(size=(T + 1, ), dtype=torch.bool),
+        episode_return=dict(size=(T + 1, ), dtype=torch.float32),
+        episode_step=dict(size=(T + 1, ), dtype=torch.int32),
         policy_logits=dict(size=(T + 1, num_actions), dtype=torch.float32),
-        baseline=dict(size=(T + 1,), dtype=torch.float32),
-        last_action=dict(size=(T + 1,), dtype=torch.int64),
-        action=dict(size=(T + 1,), dtype=torch.int64),
+        baseline=dict(size=(T + 1, ), dtype=torch.float32),
+        last_action=dict(size=(T + 1, ), dtype=torch.int64),
+        action=dict(size=(T + 1, ), dtype=torch.int64),
     )
+    specs.update(obs_specs)
     buffers: Buffers = {key: [] for key in specs}
     for _ in range(flags.num_buffers):
         for key in buffers:
@@ -319,15 +388,15 @@ def create_buffers(flags, obs_shape, num_actions) -> Buffers:
 def train(flags):  # pylint: disable=too-many-branches, too-many-statements
     if flags.xpid is None:
         flags.xpid = "torchbeast-%s" % time.strftime("%Y%m%d-%H%M%S")
-    plogger = file_writer.FileWriter(
-        xpid=flags.xpid, xp_args=flags.__dict__, rootdir=flags.savedir
-    )
+    plogger = file_writer.FileWriter(xpid=flags.xpid,
+                                     xp_args=flags.__dict__,
+                                     rootdir=flags.savedir)
     checkpointpath = os.path.expandvars(
-        os.path.expanduser("%s/%s/%s" % (flags.savedir, flags.xpid, "model.tar"))
-    )
+        os.path.expanduser("%s/%s/%s" %
+                           (flags.savedir, flags.xpid, "model.tar")))
 
     if flags.num_buffers is None:  # Set sensible default for num_buffers.
-        flags.num_buffers = max(2 * flags.num_actors, flags.batch_size)
+        flags.num_buffers = max(2 * 2 * flags.num_actors, flags.batch_size)
     if flags.num_actors >= flags.num_buffers:
         raise ValueError("num_buffers should be larger than num_actors")
     if flags.num_buffers < flags.batch_size:
@@ -346,8 +415,8 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
 
     env = create_env(flags)
 
-    model = Net(env.observation_space.shape, env.action_space.n, flags.use_lstm)
-    buffers = create_buffers(flags, env.observation_space.shape, model.num_actions)
+    model = Net(env.observation_space, env.action_space.n, flags.use_lstm)
+    buffers = create_buffers(flags, env.observation_space, env.action_space.n)
 
     model.share_memory()
 
@@ -380,9 +449,8 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
         actor.start()
         actor_processes.append(actor)
 
-    learner_model = Net(
-        env.observation_space.shape, env.action_space.n, flags.use_lstm
-    ).to(device=flags.device)
+    learner_model = Net(env.observation_space.shape, env.action_space.n,
+                        flags.use_lstm).to(device=flags.device)
 
     optimizer = torch.optim.RMSprop(
         learner_model.parameters(),
@@ -423,9 +491,8 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
                 initial_agent_state_buffers,
                 timings,
             )
-            stats = learn(
-                flags, model, learner_model, batch, agent_state, optimizer, scheduler
-            )
+            stats = learn(flags, model, learner_model, batch, agent_state,
+                          optimizer, scheduler)
             timings.time("learn")
             with lock:
                 to_log = dict(step=step)
@@ -441,9 +508,9 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
 
     threads = []
     for i in range(flags.num_learner_threads):
-        thread = threading.Thread(
-            target=batch_and_learn, name="batch-and-learn-%d" % i, args=(i,)
-        )
+        thread = threading.Thread(target=batch_and_learn,
+                                  name="batch-and-learn-%d" % i,
+                                  args=(i, ))
         thread.start()
         threads.append(thread)
 
@@ -475,9 +542,8 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
 
             sps = (step - start_step) / (timer() - start_time)
             if stats.get("episode_returns", None):
-                mean_return = (
-                    "Return per episode: %.1f. " % stats["mean_episode_return"]
-                )
+                mean_return = ("Return per episode: %.1f. " %
+                               stats["mean_episode_return"])
             else:
                 mean_return = ""
             total_loss = stats.get("total_loss", float("inf"))
@@ -510,12 +576,13 @@ def test(flags, num_episodes: int = 10):
         checkpointpath = "./latest/model.tar"
     else:
         checkpointpath = os.path.expandvars(
-            os.path.expanduser("%s/%s/%s" % (flags.savedir, flags.xpid, "model.tar"))
-        )
+            os.path.expanduser("%s/%s/%s" %
+                               (flags.savedir, flags.xpid, "model.tar")))
 
     gym_env = create_env(flags)
-    env = environment.Environment(gym_env)
-    model = Net(gym_env.observation_space.shape, gym_env.action_space.n, flags.use_lstm)
+    env = Environment(gym_env)
+    model = Net(gym_env.observation_space.shape, gym_env.action_space.n,
+                flags.use_lstm)
     model.eval()
     checkpoint = torch.load(checkpointpath, map_location="cpu")
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -537,113 +604,15 @@ def test(flags, num_episodes: int = 10):
                 observation["episode_return"].item(),
             )
     env.close()
-    logging.info(
-        "Average returns over %i steps: %.1f", num_episodes, sum(returns) / len(returns)
-    )
+    logging.info("Average returns over %i steps: %.1f", num_episodes,
+                 sum(returns) / len(returns))
 
 
-class AtariNet(nn.Module):
-    def __init__(self, observation_shape, num_actions, use_lstm=False):
-        super(AtariNet, self).__init__()
-        self.observation_shape = observation_shape
-        self.num_actions = num_actions
-
-        # Feature extraction.
-        self.conv1 = nn.Conv2d(
-            in_channels=self.observation_shape[0],
-            out_channels=32,
-            kernel_size=8,
-            stride=4,
-        )
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
-        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
-
-        # Fully connected layer.
-        self.fc = nn.Linear(3136, 512)
-
-        # FC output size + one-hot of last action + last reward.
-        core_output_size = self.fc.out_features + num_actions + 1
-
-        self.use_lstm = use_lstm
-        if use_lstm:
-            self.core = nn.LSTM(core_output_size, core_output_size, 2)
-
-        self.policy = nn.Linear(core_output_size, self.num_actions)
-        self.baseline = nn.Linear(core_output_size, 1)
-
-    def initial_state(self, batch_size):
-        if not self.use_lstm:
-            return tuple()
-        return tuple(
-            torch.zeros(self.core.num_layers, batch_size, self.core.hidden_size)
-            for _ in range(2)
-        )
-
-    def forward(self, inputs, core_state=()):
-        x = inputs["frame"]  # [T, B, C, H, W].
-        T, B, *_ = x.shape
-        x = torch.flatten(x, 0, 1)  # Merge time and batch.
-        x = x.float() / 255.0
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = x.view(T * B, -1)
-        x = F.relu(self.fc(x))
-
-        one_hot_last_action = F.one_hot(
-            inputs["last_action"].view(T * B), self.num_actions
-        ).float()
-        clipped_reward = torch.clamp(inputs["reward"], -1, 1).view(T * B, 1)
-        core_input = torch.cat([x, clipped_reward, one_hot_last_action], dim=-1)
-
-        if self.use_lstm:
-            core_input = core_input.view(T, B, -1)
-            core_output_list = []
-            notdone = (~inputs["done"]).float()
-            for input, nd in zip(core_input.unbind(), notdone.unbind()):
-                # Reset core state to zero whenever an episode ended.
-                # Make `done` broadcastable with (num_layers, B, hidden_size)
-                # states:
-                nd = nd.view(1, -1, 1)
-                core_state = tuple(nd * s for s in core_state)
-                output, core_state = self.core(input.unsqueeze(0), core_state)
-                core_output_list.append(output)
-            core_output = torch.flatten(torch.cat(core_output_list), 0, 1)
-        else:
-            core_output = core_input
-            core_state = tuple()
-
-        policy_logits = self.policy(core_output)
-        baseline = self.baseline(core_output)
-
-        if self.training:
-            action = torch.multinomial(F.softmax(policy_logits, dim=1), num_samples=1)
-        else:
-            # Don't sample when testing.
-            action = torch.argmax(policy_logits, dim=1)
-
-        policy_logits = policy_logits.view(T, B, self.num_actions)
-        baseline = baseline.view(T, B)
-        action = action.view(T, B)
-
-        return (
-            dict(policy_logits=policy_logits, baseline=baseline, action=action),
-            core_state,
-        )
+Net = DummyNet
 
 
-Net = AtariNet
-
-
-def create_env(flags):
-    return atari_wrappers.wrap_pytorch(
-        atari_wrappers.wrap_deepmind(
-            atari_wrappers.make_atari(flags.env),
-            clip_rewards=False,
-            frame_stack=True,
-            scale=False,
-        )
-    )
+def create_env(*args, **kwargs):
+    return DummyEnv()
 
 
 def main(flags):
