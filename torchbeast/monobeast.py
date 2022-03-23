@@ -348,9 +348,11 @@ def learn(
         total_loss = pg_loss + baseline_loss + entropy_loss
 
         episode_returns = batch["episode_return"][batch["done"]]
+        episode_steps = batch["episode_step"][batch["done"]]
         stats = {
             "episode_returns": tuple(episode_returns.cpu().numpy()),
             "mean_episode_return": torch.mean(episode_returns).item(),
+            "mean_episode_step": torch.mean(episode_steps.float()).item(),
             "total_loss": total_loss.item(),
             "pg_loss": pg_loss.item(),
             "baseline_loss": baseline_loss.item(),
@@ -478,6 +480,7 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
     stat_keys = [
         "total_loss",
         "mean_episode_return",
+        "mean_episode_step",
         "pg_loss",
         "baseline_loss",
         "entropy_loss",
