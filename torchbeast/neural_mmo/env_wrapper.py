@@ -83,25 +83,25 @@ class NMMOWrapper(Wrapper):
         })
         self.action_space = spaces.Discrete(8)
         self._dead_agents = []
-        self._all_agents = []
+        self.agents = []
         self._dummy_feature = {
             key: np.zeros(shape=val.shape, dtype=val.dtype)
             for key, val in self.observation_space.items()
         }
 
     def reset(self):
-        obs_origin = super().reset()
-        obs = self.feature_parser.parse(obs_origin)
-        self._prev_obs_origin = obs_origin
+        raw_obs = super().reset()
+        obs = self.feature_parser.parse(raw_obs)
         self._dead_agents.clear()
-        self._all_agents = list(self.env.agents)
+        self.agents = list(self.env.agents)  # initial agents
+        self._prev_raw_obs = raw_obs
         return obs
 
     def step(self, actions):
         decisions = self._parse_action(actions)
-        obs_origin, reward, done, info = super().step(decisions)
-        obs = self.feature_parser.parse(obs_origin)
-        reward = self.reward_parser.parse(self._prev_obs_origin, obs_origin)
+        raw_obs, reward, done, info = super().step(decisions)
+        obs = self.feature_parser.parse(raw_obs)
+        reward = self.reward_parser.parse(self._prev_raw_obs, raw_obs)
 
         for agent_id, d in done.items():
             if d:
@@ -112,7 +112,7 @@ class NMMOWrapper(Wrapper):
             reward[agent_id] = 0
             done[agent_id] = True
 
-        self._prev_obs_origin = obs_origin
+        self._prev_raw_obs = raw_obs
         return obs, reward, done, info
 
     def _parse_action(self, actions):
@@ -147,34 +147,29 @@ class NMMOWrapper(Wrapper):
                     }
                 }
             else:
-                raise ValueError("invalid action: {act}")
+                raise ValueError(f"invalid action: {act}")
         return decisions
 
 
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
     import time
-    sys.path.append(Path(__file__).parent)
-
-    from config import DebugConfig
+    from .config import DebugConfig
     env = NMMOWrapper(nmmo.Env(config=DebugConfig()))
     for i in range(10):
         start, step = time.time(), 0
         env.reset()
-        episode_return = {agent_id: 0 for agent_id in env._all_agents}
+        episode_return = {agent_id: 0 for agent_id in env.agents}
         while True:
             actions = {
                 agent_id: env.action_space.sample()
-                for agent_id in env._all_agents
+                for agent_id in env.agents
             }
             obs, reward, done, info = env.step(actions)
             step += 1
             for agent_id, rew in reward.items():
                 episode_return[agent_id] += rew
-            # print(done)
             if all(done.values()):
                 break
         print(
-            f"episode i, total step: {step}, episode return: {episode_return}, elapsed: {time.time() - start}"
+            f"episode {i}, total step: {step}, episode return: {episode_return}, elapsed: {time.time() - start}"
         )

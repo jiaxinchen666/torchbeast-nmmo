@@ -18,10 +18,7 @@ def random_action():
 
 
 if __name__ == "__main__":
-    import sys
-    from pathlib import Path
-    sys.path.append(Path(__file__).parent)
-    from config import DebugConfig
+    from .config import DebugConfig
     env = nmmo.Env(config=DebugConfig())
     obs = env.reset()
     print(env.agents)
@@ -33,8 +30,6 @@ if __name__ == "__main__":
         t += 1
         if t >= horizon:
             break
-        print("agents: ", env.agents)
-        print("obs:", obs.keys())
-        print("done:", dones)
-        print("dead:", env.dead.keys())
+        print(f"agents: {env.agents}, dead: {env.dead.keys()}")
+        print(f"obs: {obs.keys()}, dones: {dones.keys()}")
     env.terminal()

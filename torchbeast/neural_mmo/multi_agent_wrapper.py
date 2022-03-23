@@ -17,17 +17,20 @@ from typing import Dict
 import torch
 import tree
 from numpy import ndarray
+from .env_wrapper import NMMOWrapper
 
 
 class MultiAgentEnvironment:
-    def __init__(self, gym_env):
-        self.gym_env = gym_env  # pettingzoo environment interface
+    def __init__(self, gym_env: NMMOWrapper):
+        if not isinstance(gym_env, NMMOWrapper):
+            raise RuntimeError(f"gym_env is not instance of NMMOWrapper.")
+        self.gym_env = gym_env
 
     def initial(self):
         initial_frame = self.gym_env.reset()
-        self.episode_return = {agent_id: 0 for agent_id in self.gym_env._all_agents}
-        self.episode_step = {agent_id: 0 for agent_id in self.gym_env._all_agents}
         output = self.format_output(initial_frame)
+        self.episode_return = {agent_id: 0 for agent_id in self.gym_env.agents}
+        self.episode_step = {agent_id: 0 for agent_id in self.gym_env.agents}
         return output
 
     def step(self, actions: Dict[int, int]):
@@ -57,6 +60,8 @@ class MultiAgentEnvironment:
                       done=None,
                       episode_return=None,
                       episode_step=None):
+        assert isinstance(frame,
+                          dict), f"only support frame in the format of dict"
         if actions is None:
             actions = {agent_id: 0 for agent_id in self.gym_env.agents}
         if reward is None:
@@ -84,9 +89,9 @@ class MultiAgentEnvironment:
         episode_step = tree.map_structure(_format, episode_step)
 
         output = {}
-        for agent_id in self.gym_env._all_agents:
+        for agent_id in self.gym_env.agents:
             o = {}
-            o.update(frame[agent_id])  # frame is a dict
+            o.update(frame[agent_id])
             o["last_action"] = actions[agent_id]
             o["reward"] = reward[agent_id]
             o["done"] = done[agent_id]

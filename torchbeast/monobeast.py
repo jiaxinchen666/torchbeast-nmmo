@@ -34,7 +34,6 @@ from torch import nn
 from torch.nn import functional as F
 
 from torchbeast.core import file_writer, prof, vtrace
-from torchbeast.dummy_env import DummyEnv, DummyNet
 from torchbeast.neural_mmo.config import DebugConfig
 from torchbeast.neural_mmo.multi_agent_wrapper import \
     MultiAgentEnvironment as Environment
@@ -63,9 +62,11 @@ parser.add_argument("--mode", default="train",
 parser.add_argument("--xpid", default=None,
                     help="Experiment id (default: None).")
 
-# Training settings.
+# multi-agent setting
 parser.add_argument("--num_agents", default=4, type=int, metavar="N",
                     help="Number of agents (default: 4).")
+
+# Training settings.
 parser.add_argument("--disable_checkpoint", action="store_true",
                     help="Disable saving checkpoint.")
 parser.add_argument("--savedir", default="~/logs/torchbeast",
@@ -205,7 +206,7 @@ def act(
         agent_output = unbatch(agent_output_batch, agent_ids)
         while True:
             free_indices = [
-                free_queue.get() for _ in range(len(gym_env._all_agents))
+                free_queue.get() for _ in range(len(gym_env.agents))
             ]
             if None in free_indices:
                 break
