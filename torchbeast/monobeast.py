@@ -25,6 +25,7 @@ from typing import Dict, List
 
 os.environ["OMP_NUM_THREADS"] = "1"  # Necessary for multithreading.
 
+import nmmo
 import numpy as np
 import torch
 import tree
@@ -32,9 +33,13 @@ from torch import multiprocessing as mp
 from torch import nn
 from torch.nn import functional as F
 
-from torchbeast.core.multi_agent_env import MultiAgentEnvironment as Environment
 from torchbeast.core import file_writer, prof, vtrace
 from torchbeast.dummy_env import DummyEnv, DummyNet
+from torchbeast.neural_mmo.config import DebugConfig
+from torchbeast.neural_mmo.multi_agent_wrapper import \
+    MultiAgentEnvironment as Environment
+from torchbeast.neural_mmo.env_wrapper import NMMOWrapper
+from torchbeast.neural_mmo.net import NMMONet
 
 to_torch_dtype = {
     "uint8": torch.uint8,
@@ -59,6 +64,8 @@ parser.add_argument("--xpid", default=None,
                     help="Experiment id (default: None).")
 
 # Training settings.
+parser.add_argument("--num_agents", default=4, type=int, metavar="N",
+                    help="Number of agents (default: 4).")
 parser.add_argument("--disable_checkpoint", action="store_true",
                     help="Disable saving checkpoint.")
 parser.add_argument("--savedir", default="~/logs/torchbeast",
@@ -198,7 +205,7 @@ def act(
         agent_output = unbatch(agent_output_batch, agent_ids)
         while True:
             free_indices = [
-                free_queue.get() for _ in range(len(gym_env.agents))
+                free_queue.get() for _ in range(len(gym_env._all_agents))
             ]
             if None in free_indices:
                 break
@@ -396,7 +403,8 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
                            (flags.savedir, flags.xpid, "model.tar")))
 
     if flags.num_buffers is None:  # Set sensible default for num_buffers.
-        flags.num_buffers = max(2 * 2 * flags.num_actors, flags.batch_size)
+        flags.num_buffers = max(2 * flags.num_agents * flags.num_actors,
+                                flags.batch_size)
     if flags.num_actors >= flags.num_buffers:
         raise ValueError("num_buffers should be larger than num_actors")
     if flags.num_buffers < flags.batch_size:
@@ -560,7 +568,7 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
     else:
         for thread in threads:
             thread.join()
-        logging.info("Learning finished after %d steps.", step)
+        logging.info("Learning after %d steps.", step)
     finally:
         for _ in range(flags.num_actors):
             free_queue.put(None)
@@ -608,11 +616,12 @@ def test(flags, num_episodes: int = 10):
                  sum(returns) / len(returns))
 
 
-Net = DummyNet
+Net = NMMONet
 
 
 def create_env(*args, **kwargs):
-    return DummyEnv()
+    config = DebugConfig()
+    return NMMOWrapper(nmmo.Env(config=config))
 
 
 def main(flags):

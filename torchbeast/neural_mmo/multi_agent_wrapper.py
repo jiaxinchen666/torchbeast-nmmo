@@ -24,9 +24,9 @@ class MultiAgentEnvironment:
         self.gym_env = gym_env  # pettingzoo environment interface
 
     def initial(self):
-        self.episode_return = {agent_id: 0 for agent_id in self.gym_env.agents}
-        self.episode_step = {agent_id: 0 for agent_id in self.gym_env.agents}
         initial_frame = self.gym_env.reset()
+        self.episode_return = {agent_id: 0 for agent_id in self.gym_env._all_agents}
+        self.episode_step = {agent_id: 0 for agent_id in self.gym_env._all_agents}
         output = self.format_output(initial_frame)
         return output
 
@@ -84,7 +84,7 @@ class MultiAgentEnvironment:
         episode_step = tree.map_structure(_format, episode_step)
 
         output = {}
-        for agent_id in self.gym_env.agents:
+        for agent_id in self.gym_env._all_agents:
             o = {}
             o.update(frame[agent_id])  # frame is a dict
             o["last_action"] = actions[agent_id]
